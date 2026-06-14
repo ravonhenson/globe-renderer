@@ -1,6 +1,6 @@
 #include "GlobeApp.h"
 
-#include "UvSphereMesh.h"
+#include "IcosphereMesh.h"
 #include "Vertex.h"
 #include "tiff_loader.h"
 
@@ -17,9 +17,9 @@ constexpr uint32_t kWindowWidth = 1024;
 constexpr uint32_t kWindowHeight = 768;
 constexpr int kMaxFramesInFlight = 2;
 
-// Cap the globe texture so it stays comfortably within common GPU 2D image
-// size limits and load time, regardless of the source raster's resolution.
-constexpr uint32_t kMaxTextureDimension = 8192;
+// Effectively uncapped: the only real limit is the GPU's maxImageDimension2D,
+// so the globe texture loads at the source raster's native resolution.
+constexpr uint32_t kMaxTextureDimension = UINT32_MAX;
 
 constexpr const char* kEarthTexturePath = "assets/natural-earth-raster.tif";
 
@@ -1118,7 +1118,7 @@ void GlobeApp::createTextureSampler() {
 void GlobeApp::createMeshBuffers() {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
-    buildUvSphereMesh(vertices, indices);
+    buildIcosphereMesh(vertices, indices);
     indexCount_ = static_cast<uint32_t>(indices.size());
 
     createDeviceLocalBuffer(vertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer_, vertexBufferMemory_);
