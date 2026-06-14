@@ -1,0 +1,210 @@
+#pragma once
+
+#include "VulkanUtils.h"
+
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
+
+#include <glm/glm.hpp>
+
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <optional>
+#include <vector>
+
+struct QueueFamilyIndices {
+    std::optional<uint32_t> graphicsFamily;
+    std::optional<uint32_t> presentFamily;
+
+    bool isComplete() const {
+        return graphicsFamily.has_value() && presentFamily.has_value();
+    }
+};
+
+struct SwapChainSupportDetails {
+    VkSurfaceCapabilitiesKHR capabilities{};
+    std::vector<VkSurfaceFormatKHR> formats;
+    std::vector<VkPresentModeKHR> presentModes;
+};
+
+// Owns the window, the Vulkan context, the scene's GPU resources, and the
+// per-frame render loop for the globe renderer.
+class GlobeApp {
+public:
+    explicit GlobeApp(std::filesystem::path executablePath);
+
+    void run();
+
+private:
+    GLFWwindow* window_ = nullptr;
+
+    VkInstance instance_ = VK_NULL_HANDLE;
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties physicalDeviceProperties_{};
+    VkPhysicalDeviceFeatures enabledFeatures_{};
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkQueue graphicsQueue_ = VK_NULL_HANDLE;
+    VkQueue presentQueue_ = VK_NULL_HANDLE;
+
+    VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+    std::vector<VkImage> swapchainImages_;
+    VkFormat swapchainImageFormat_ = VK_FORMAT_UNDEFINED;
+    VkExtent2D swapchainExtent_{};
+    std::vector<VkImageView> swapchainImageViews_;
+
+    VkRenderPass renderPass_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline graphicsPipeline_ = VK_NULL_HANDLE;
+    VkPipeline wireframePipeline_ = VK_NULL_HANDLE;
+
+    VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
+    VkImage depthImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory depthImageMemory_ = VK_NULL_HANDLE;
+    VkImageView depthImageView_ = VK_NULL_HANDLE;
+
+    std::vector<VkFramebuffer> swapchainFramebuffers_;
+    VkCommandPool commandPool_ = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> commandBuffers_;
+
+    VkBuffer vertexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory vertexBufferMemory_ = VK_NULL_HANDLE;
+    VkBuffer indexBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory indexBufferMemory_ = VK_NULL_HANDLE;
+    uint32_t indexCount_ = 0;
+
+    uint32_t textureMipLevels_ = 1;
+    VkImage textureImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory textureImageMemory_ = VK_NULL_HANDLE;
+    VkImageView textureImageView_ = VK_NULL_HANDLE;
+    VkSampler textureSampler_ = VK_NULL_HANDLE;
+
+    std::vector<VkBuffer> uniformBuffers_;
+    std::vector<VkDeviceMemory> uniformBuffersMemory_;
+    std::vector<void*> uniformBuffersMapped_;
+
+    VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> descriptorSets_;
+
+    std::vector<VkSemaphore> imageAvailableSemaphores_;
+    std::vector<VkSemaphore> renderFinishedSemaphores_;
+    std::vector<VkFence> inFlightFences_;
+    std::vector<VkFence> imagesInFlight_;
+    size_t currentFrame_ = 0;
+    bool framebufferResized_ = false;
+    std::filesystem::path executablePath_;
+
+    // Camera/input tuning.
+    static constexpr double kInitialCameraDistance = 2.5;
+    static constexpr double kMinCameraDistance = 1.2;
+    static constexpr double kMaxCameraDistance = 6.0;
+    static constexpr double kZoomSpeed = 0.2;
+    static constexpr float kRotationSpeed = 0.005f;
+    static constexpr float kMaxPitch = glm::radians(89.0f);
+
+    double cameraDistance_;
+    float rotationYaw_ = 0.0f;
+    float rotationPitch_ = 0.0f;
+    bool dragging_ = false;
+    double lastCursorX_ = 0.0;
+    double lastCursorY_ = 0.0;
+    bool wireframeEnabled_ = false;
+
+    static void framebufferResizeCallback(GLFWwindow* window, int width, int height);
+    static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset);
+    static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
+    static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
+    static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos);
+
+    void initWindow();
+    void initVulkan();
+    void mainLoop();
+    void cleanupSwapchain();
+    void cleanup();
+    void recreateSwapchain();
+
+    void createInstance();
+    void createSurface();
+    QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device) const;
+    SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device) const;
+    bool isDeviceSuitable(VkPhysicalDevice device) const;
+    void pickPhysicalDevice();
+    void createLogicalDevice();
+
+    VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats) const;
+    VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& availablePresentModes) const;
+    VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities) const;
+    void createSwapchain();
+
+    VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags, uint32_t mipLevels) const;
+    void createImageViews();
+
+    VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features) const;
+    VkFormat findDepthFormat() const;
+    void createRenderPass();
+    void createDescriptorSetLayout();
+
+    std::filesystem::path resolveResourcePath(const std::filesystem::path& relativePath) const;
+    std::vector<char> loadShaderBinary(const std::filesystem::path& relativePath) const;
+    VkShaderModule createShaderModule(const std::vector<char>& code) const;
+    void createGraphicsPipeline();
+
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
+    void createImage(uint32_t width, uint32_t height, uint32_t mipLevels, VkFormat format, VkImageTiling tiling,
+                      VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& memory) const;
+    void createDepthResources();
+    void createFramebuffers();
+
+    void createCommandPool();
+    VkCommandBuffer beginSingleTimeCommands() const;
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer) const;
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& memory) const;
+    void copyBuffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) const;
+    void transitionImageLayout(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, uint32_t mipLevels) const;
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) const;
+    void generateMipmaps(VkImage image, VkFormat format, int32_t texWidth, int32_t texHeight, uint32_t mipLevels) const;
+
+    void createTextureImage();
+    void createTextureImageView();
+    void createTextureSampler();
+
+    // Uploads `data` into a device-local buffer via a temporary host-visible
+    // staging buffer. Templated on element type so it can build both the
+    // vertex buffer (Vertex) and the index buffer (uint32_t); the generic
+    // body means this stays defined here in the header.
+    template <typename T>
+    void createDeviceLocalBuffer(const std::vector<T>& data, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory) const {
+        const VkDeviceSize size = sizeof(T) * data.size();
+
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
+        createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      stagingBuffer, stagingBufferMemory);
+
+        void* mapped = nullptr;
+        checkVk(vkMapMemory(device_, stagingBufferMemory, 0, size, 0, &mapped), "Failed to map staging buffer");
+        std::memcpy(mapped, data.data(), static_cast<size_t>(size));
+        vkUnmapMemory(device_, stagingBufferMemory);
+
+        createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer, memory);
+        copyBuffer(stagingBuffer, buffer, size);
+
+        vkDestroyBuffer(device_, stagingBuffer, nullptr);
+        vkFreeMemory(device_, stagingBufferMemory, nullptr);
+    }
+
+    void createMeshBuffers();
+    void createUniformBuffers();
+    void updateUniformBuffer(uint32_t currentImage) const;
+
+    void createDescriptorPool();
+    void createDescriptorSets();
+
+    void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex);
+    void createCommandBuffers();
+    void createSyncObjects();
+    void drawFrame();
+};
