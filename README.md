@@ -10,6 +10,7 @@ the Natural Earth raster basemap.
 - A C++17 compiler
 - `assets/natural-earth-raster.tif` (uncompressed 8-bit RGB TIFF) present in
   the project's `assets/` directory
+- `assets/ETOPO1_Ice_g_geotiff.tif`
 
 ## Build
 
