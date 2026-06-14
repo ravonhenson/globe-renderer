@@ -22,6 +22,13 @@ constexpr int kMaxFramesInFlight = 2;
 constexpr uint32_t kMaxTextureDimension = UINT32_MAX;
 
 constexpr const char* kEarthTexturePath = "assets/natural-earth-raster.tif";
+constexpr const char* kHeightmapTexturePath = "assets/ETOPO1_Ice_g_geotiff.tif";
+
+// The icosphere mesh has far fewer vertices than ETOPO1's native 21601x10801
+// grid, so the heightmap is downsampled well below the color texture's
+// resolution; this keeps VRAM usage and load time down with no loss in
+// displacement fidelity at the current mesh density.
+constexpr uint32_t kMaxHeightmapDimension = 4096;
 
 struct UniformBufferObject {
     glm::mat4 model;
@@ -124,6 +131,9 @@ void GlobeApp::initVulkan() {
     createTextureImage();
     createTextureImageView();
     createTextureSampler();
+    createHeightmapImage();
+    createHeightmapImageView();
+    createHeightmapSampler();
     createMeshBuffers();
     createUniformBuffers();
     createDescriptorPool();
@@ -178,6 +188,11 @@ void GlobeApp::cleanup() {
     vkDestroyImageView(device_, textureImageView_, nullptr);
     vkDestroyImage(device_, textureImage_, nullptr);
     vkFreeMemory(device_, textureImageMemory_, nullptr);
+
+    vkDestroySampler(device_, heightSampler_, nullptr);
+    vkDestroyImageView(device_, heightImageView_, nullptr);
+    vkDestroyImage(device_, heightImage_, nullptr);
+    vkFreeMemory(device_, heightImageMemory_, nullptr);
 
     for (size_t i = 0; i < uniformBuffers_.size(); ++i) {
         vkDestroyBuffer(device_, uniformBuffers_[i], nullptr);
@@ -587,7 +602,13 @@ void GlobeApp::createDescriptorSetLayout() {
     samplerLayoutBinding.descriptorCount = 1;
     samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    const std::array<VkDescriptorSetLayoutBinding, 2> bindings = {uboLayoutBinding, samplerLayoutBinding};
+    VkDescriptorSetLayoutBinding heightSamplerLayoutBinding{};
+    heightSamplerLayoutBinding.binding = 2;
+    heightSamplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    heightSamplerLayoutBinding.descriptorCount = 1;
+    heightSamplerLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    const std::array<VkDescriptorSetLayoutBinding, 3> bindings = {uboLayoutBinding, samplerLayoutBinding, heightSamplerLayoutBinding};
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -955,7 +976,7 @@ void GlobeApp::transitionImageLayout(VkImage image, VkImageLayout oldLayout, VkI
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        destinationStage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     } else {
         throw std::runtime_error("Unsupported image layout transition");
     }
@@ -1115,6 +1136,61 @@ void GlobeApp::createTextureSampler() {
     checkVk(vkCreateSampler(device_, &samplerInfo, nullptr, &textureSampler_), "Failed to create texture sampler");
 }
 
+void GlobeApp::createHeightmapImage() {
+    const uint32_t maxDimension = std::min(kMaxHeightmapDimension, physicalDeviceProperties_.limits.maxImageDimension2D);
+    const HeightmapImage heightmap = loadTiffHeightmap(resolveResourcePath(kHeightmapTexturePath), maxDimension);
+
+    const VkDeviceSize imageSize = static_cast<VkDeviceSize>(heightmap.samples.size() * sizeof(float));
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
+    createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  stagingBuffer, stagingBufferMemory);
+
+    void* data = nullptr;
+    checkVk(vkMapMemory(device_, stagingBufferMemory, 0, imageSize, 0, &data), "Failed to map heightmap staging buffer");
+    std::memcpy(data, heightmap.samples.data(), static_cast<size_t>(imageSize));
+    vkUnmapMemory(device_, stagingBufferMemory);
+
+    createImage(heightmap.width, heightmap.height, 1, VK_FORMAT_R32_SFLOAT, VK_IMAGE_TILING_OPTIMAL,
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, heightImage_, heightImageMemory_);
+
+    transitionImageLayout(heightImage_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
+    copyBufferToImage(stagingBuffer, heightImage_, heightmap.width, heightmap.height);
+    transitionImageLayout(heightImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1);
+
+    vkDestroyBuffer(device_, stagingBuffer, nullptr);
+    vkFreeMemory(device_, stagingBufferMemory, nullptr);
+}
+
+void GlobeApp::createHeightmapImageView() {
+    heightImageView_ = createImageView(heightImage_, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+}
+
+void GlobeApp::createHeightmapSampler() {
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    samplerInfo.mipLodBias = 0.0f;
+
+    checkVk(vkCreateSampler(device_, &samplerInfo, nullptr, &heightSampler_), "Failed to create heightmap sampler");
+}
+
 void GlobeApp::createMeshBuffers() {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
@@ -1158,7 +1234,7 @@ void GlobeApp::createDescriptorPool() {
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = static_cast<uint32_t>(kMaxFramesInFlight);
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = static_cast<uint32_t>(kMaxFramesInFlight);
+    poolSizes[1].descriptorCount = static_cast<uint32_t>(kMaxFramesInFlight) * 2;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1192,7 +1268,12 @@ void GlobeApp::createDescriptorSets() {
         imageInfo.imageView = textureImageView_;
         imageInfo.sampler = textureSampler_;
 
-        std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+        VkDescriptorImageInfo heightImageInfo{};
+        heightImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        heightImageInfo.imageView = heightImageView_;
+        heightImageInfo.sampler = heightSampler_;
+
+        std::array<VkWriteDescriptorSet, 3> descriptorWrites{};
         descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         descriptorWrites[0].dstSet = descriptorSets_[i];
         descriptorWrites[0].dstBinding = 0;
@@ -1208,6 +1289,14 @@ void GlobeApp::createDescriptorSets() {
         descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         descriptorWrites[1].descriptorCount = 1;
         descriptorWrites[1].pImageInfo = &imageInfo;
+
+        descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[2].dstSet = descriptorSets_[i];
+        descriptorWrites[2].dstBinding = 2;
+        descriptorWrites[2].dstArrayElement = 0;
+        descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        descriptorWrites[2].descriptorCount = 1;
+        descriptorWrites[2].pImageInfo = &heightImageInfo;
 
         vkUpdateDescriptorSets(device_, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
     }

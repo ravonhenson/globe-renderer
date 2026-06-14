@@ -81,6 +81,11 @@ private:
     VkImageView textureImageView_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
 
+    VkImage heightImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory heightImageMemory_ = VK_NULL_HANDLE;
+    VkImageView heightImageView_ = VK_NULL_HANDLE;
+    VkSampler heightSampler_ = VK_NULL_HANDLE;
+
     std::vector<VkBuffer> uniformBuffers_;
     std::vector<VkDeviceMemory> uniformBuffersMemory_;
     std::vector<void*> uniformBuffersMapped_;
@@ -169,6 +174,10 @@ private:
     void createTextureImage();
     void createTextureImageView();
     void createTextureSampler();
+
+    void createHeightmapImage();
+    void createHeightmapImageView();
+    void createHeightmapSampler();
 
     // Uploads `data` into a device-local buffer via a temporary host-visible
     // staging buffer. Templated on element type so it can build both the

@@ -11,6 +11,14 @@ struct RgbaImage {
     std::vector<uint8_t> pixels; // width * height * 4 bytes, row-major, top row first
 };
 
+// A decoded single-channel elevation grid, in meters, ready to be uploaded
+// to a Vulkan texture (e.g. as VK_FORMAT_R32_SFLOAT).
+struct HeightmapImage {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<float> samples; // width * height, row-major, top row first; meters
+};
+
 // Loads an uncompressed, 8-bit-per-channel RGB (or RGBA) TIFF file.
 //
 // If the source image is larger than maxDimension in either axis, it is
@@ -19,3 +27,10 @@ struct RgbaImage {
 // rasters (e.g. whole-earth basemaps) from exceeding GPU texture limits or
 // requiring the entire file to be held in memory at once.
 RgbaImage loadTiffRgba(const std::filesystem::path& path, uint32_t maxDimension);
+
+// Loads an uncompressed, single-channel, 16-bit signed-integer TIFF file
+// (e.g. an ETOPO1 elevation raster) as a grid of elevations in meters.
+//
+// Downsampling works the same way as loadTiffRgba: elevations are averaged
+// over an integer box filter so both output dimensions are <= maxDimension.
+HeightmapImage loadTiffHeightmap(const std::filesystem::path& path, uint32_t maxDimension);
