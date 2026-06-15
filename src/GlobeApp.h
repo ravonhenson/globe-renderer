@@ -1,5 +1,6 @@
 #pragma once
 
+#include "QuadtreeMesh.h"
 #include "VulkanUtils.h"
 
 #define GLFW_INCLUDE_VULKAN
@@ -7,9 +8,11 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <optional>
 #include <vector>
 
@@ -26,6 +29,15 @@ struct SwapChainSupportDetails {
     VkSurfaceCapabilitiesKHR capabilities{};
     std::vector<VkSurfaceFormatKHR> formats;
     std::vector<VkPresentModeKHR> presentModes;
+};
+
+// Result of a (possibly background) quadtree mesh rebuild: the selected
+// leaves plus their tessellated vertex/index data, ready to be memcpy'd
+// into the GPU-mapped buffers on the render thread.
+struct MeshBuildResult {
+    std::vector<QuadtreeMesh::Patch> leaves;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
 };
 
 // Owns the window, the Vulkan context, the scene's GPU resources, and the
@@ -69,11 +81,41 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
 
-    VkBuffer vertexBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory vertexBufferMemory_ = VK_NULL_HANDLE;
-    VkBuffer indexBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory indexBufferMemory_ = VK_NULL_HANDLE;
-    uint32_t indexCount_ = 0;
+    // Number of frames that may be in flight at once (matches the
+    // swapchain's sync object count). Vertex/index buffers are
+    // double-buffered, one set per in-flight frame slot, so updateMesh() can
+    // safely overwrite a slot's buffers via memcpy as soon as
+    // vkWaitForFences confirms the GPU is done with that slot's prior frame.
+    static constexpr size_t kMaxFramesInFlight = 2;
+
+    // Persistently-mapped, host-visible vertex/index buffers sized for
+    // QuadtreeMesh::kMaxVertices/kMaxIndices, one set per in-flight frame
+    // slot. Rewritten in place by updateMesh() whenever the active leaf set
+    // changes.
+    std::array<VkBuffer, kMaxFramesInFlight> vertexBuffers_{};
+    std::array<VkDeviceMemory, kMaxFramesInFlight> vertexBufferMemories_{};
+    std::array<void*, kMaxFramesInFlight> vertexBuffersMapped_{};
+    std::array<VkBuffer, kMaxFramesInFlight> indexBuffers_{};
+    std::array<VkDeviceMemory, kMaxFramesInFlight> indexBufferMemories_{};
+    std::array<void*, kMaxFramesInFlight> indexBuffersMapped_{};
+    std::array<uint32_t, kMaxFramesInFlight> indexCounts_{};
+    std::vector<QuadtreeMesh::Patch> activeLeafPatches_;
+    // Object-space camera position at the last LOD rebuild kickoff, used to
+    // skip starting a new rebuild for tiny camera movements. Initialized
+    // far from any real camera position so the first call to updateMesh()
+    // always rebuilds.
+    glm::vec3 lastLodCameraPos_{1e9f, 1e9f, 1e9f};
+    // Quadtree mesh rebuilds (LOD selection + retessellation) are expensive
+    // enough that doing them synchronously on the render thread causes
+    // visible frame drops during continuous camera movement. updateMesh()
+    // instead runs at most one rebuild at a time on a background thread and
+    // swaps the result into the GPU-mapped buffers once it's ready.
+    std::future<MeshBuildResult> meshFuture_;
+    // A finished background build, staged for propagation into every
+    // in-flight frame slot's buffers (one slot per updateMesh() call) so the
+    // GPU never observes a partially-overwritten buffer.
+    std::optional<MeshBuildResult> pendingMeshResult_;
+    int pendingMeshWritesRemaining_ = 0;
 
     uint32_t textureMipLevels_ = 1;
     VkImage textureImage_ = VK_NULL_HANDLE;
@@ -103,11 +145,18 @@ private:
 
     // Camera/input tuning.
     static constexpr double kInitialCameraDistance = 2.5;
-    static constexpr double kMinCameraDistance = 1.2;
+    static constexpr double kMinCameraDistance = 1.15;
     static constexpr double kMaxCameraDistance = 6.0;
-    static constexpr double kZoomSpeed = 0.2;
+    static constexpr double kZoomSpeed = 0.05;
     static constexpr float kRotationSpeed = 0.005f;
     static constexpr float kMaxPitch = glm::radians(89.0f);
+
+    // Minimum object-space camera movement (in unit-sphere units) before
+    // the quadtree LOD is re-evaluated. Without this, the active leaf set
+    // changes on almost every frame during rotation (the "near point" on
+    // the sphere shifts continuously), forcing a full mesh retessellation
+    // every frame.
+    static constexpr float kLodRebuildThreshold = 0.05f;
 
     double cameraDistance_;
     float rotationYaw_ = 0.0f;
@@ -116,6 +165,7 @@ private:
     double lastCursorX_ = 0.0;
     double lastCursorY_ = 0.0;
     bool wireframeEnabled_ = false;
+    bool fpsCounterEnabled_ = false;
 
     static void framebufferResizeCallback(GLFWwindow* window, int width, int height);
     static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset);
@@ -206,6 +256,9 @@ private:
     }
 
     void createMeshBuffers();
+    glm::mat4 computeModelRotation() const;
+    glm::vec3 computeCameraObjectPos() const;
+    void updateMesh();
     void createUniformBuffers();
     void updateUniformBuffer(uint32_t currentImage) const;
 

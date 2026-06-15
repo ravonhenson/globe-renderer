@@ -1,6 +1,6 @@
 # Globe Renderer
 
-Minimal C++/CMake Vulkan app that renders a rotating, textured 3D globe using
+Minimal C++/CMake Vulkan app that renders a textured 3D globe using
 the Natural Earth raster basemap.
 
 ## Prerequisites

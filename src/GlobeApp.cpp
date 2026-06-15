@@ -1,6 +1,6 @@
 #include "GlobeApp.h"
 
-#include "IcosphereMesh.h"
+#include "QuadtreeMesh.h"
 #include "Vertex.h"
 #include "tiff_loader.h"
 
@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -15,7 +17,6 @@ namespace {
 
 constexpr uint32_t kWindowWidth = 1024;
 constexpr uint32_t kWindowHeight = 768;
-constexpr int kMaxFramesInFlight = 2;
 
 // Effectively uncapped: the only real limit is the GPU's maxImageDimension2D,
 // so the globe texture loads at the source raster's native resolution.
@@ -78,6 +79,12 @@ void GlobeApp::keyCallback(GLFWwindow* window, int key, int /*scancode*/, int ac
     auto* app = reinterpret_cast<GlobeApp*>(glfwGetWindowUserPointer(window));
     if (key == GLFW_KEY_L && action == GLFW_PRESS) {
         app->wireframeEnabled_ = !app->wireframeEnabled_;
+    }
+    if (key == GLFW_KEY_F && action == GLFW_PRESS) {
+        app->fpsCounterEnabled_ = !app->fpsCounterEnabled_;
+        if (!app->fpsCounterEnabled_) {
+            glfwSetWindowTitle(window, "Globe Renderer");
+        }
     }
 }
 
@@ -143,9 +150,25 @@ void GlobeApp::initVulkan() {
 }
 
 void GlobeApp::mainLoop() {
+    auto lastFpsUpdate = std::chrono::steady_clock::now();
+    int framesSinceFpsUpdate = 0;
+
     while (!glfwWindowShouldClose(window_)) {
         glfwPollEvents();
         drawFrame();
+
+        if (fpsCounterEnabled_) {
+            ++framesSinceFpsUpdate;
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsedSeconds = std::chrono::duration<double>(now - lastFpsUpdate).count();
+            if (elapsedSeconds >= 0.5) {
+                char title[64];
+                std::snprintf(title, sizeof(title), "Globe Renderer - %.1f FPS", framesSinceFpsUpdate / elapsedSeconds);
+                glfwSetWindowTitle(window_, title);
+                framesSinceFpsUpdate = 0;
+                lastFpsUpdate = now;
+            }
+        }
     }
 
     checkVk(vkDeviceWaitIdle(device_), "Failed to wait for device idle");
@@ -202,10 +225,12 @@ void GlobeApp::cleanup() {
     vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
     vkDestroyDescriptorSetLayout(device_, descriptorSetLayout_, nullptr);
 
-    vkDestroyBuffer(device_, indexBuffer_, nullptr);
-    vkFreeMemory(device_, indexBufferMemory_, nullptr);
-    vkDestroyBuffer(device_, vertexBuffer_, nullptr);
-    vkFreeMemory(device_, vertexBufferMemory_, nullptr);
+    for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
+        vkDestroyBuffer(device_, indexBuffers_[i], nullptr);
+        vkFreeMemory(device_, indexBufferMemories_[i], nullptr);
+        vkDestroyBuffer(device_, vertexBuffers_[i], nullptr);
+        vkFreeMemory(device_, vertexBufferMemories_[i], nullptr);
+    }
 
     for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
         vkDestroySemaphore(device_, renderFinishedSemaphores_[i], nullptr);
@@ -1192,13 +1217,109 @@ void GlobeApp::createHeightmapSampler() {
 }
 
 void GlobeApp::createMeshBuffers() {
-    std::vector<Vertex> vertices;
-    std::vector<uint32_t> indices;
-    buildIcosphereMesh(vertices, indices);
-    indexCount_ = static_cast<uint32_t>(indices.size());
+    const VkDeviceSize vertexBufferSize = sizeof(Vertex) * QuadtreeMesh::kMaxVertices;
+    const VkDeviceSize indexBufferSize = sizeof(uint32_t) * QuadtreeMesh::kMaxIndices;
 
-    createDeviceLocalBuffer(vertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer_, vertexBufferMemory_);
-    createDeviceLocalBuffer(indices, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer_, indexBufferMemory_);
+    for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
+        createBuffer(vertexBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      vertexBuffers_[i], vertexBufferMemories_[i]);
+        checkVk(vkMapMemory(device_, vertexBufferMemories_[i], 0, vertexBufferSize, 0, &vertexBuffersMapped_[i]), "Failed to map vertex buffer");
+
+        createBuffer(indexBufferSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      indexBuffers_[i], indexBufferMemories_[i]);
+        checkVk(vkMapMemory(device_, indexBufferMemories_[i], 0, indexBufferSize, 0, &indexBuffersMapped_[i]), "Failed to map index buffer");
+    }
+
+    // Build the initial mesh synchronously so a complete mesh exists before
+    // the first frame is recorded. Subsequent rebuilds (from updateMesh)
+    // happen on a background thread.
+    const glm::vec3 cameraObjectPos = computeCameraObjectPos();
+    lastLodCameraPos_ = cameraObjectPos;
+
+    MeshBuildResult result;
+    result.leaves = QuadtreeMesh::selectLeafPatches(cameraObjectPos);
+    QuadtreeMesh::generateMesh(result.leaves, result.vertices, result.indices);
+
+    if (result.vertices.size() > QuadtreeMesh::kMaxVertices || result.indices.size() > QuadtreeMesh::kMaxIndices) {
+        throw std::runtime_error("Quadtree mesh exceeded vertex/index buffer capacity");
+    }
+
+    for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
+        std::memcpy(vertexBuffersMapped_[i], result.vertices.data(), sizeof(Vertex) * result.vertices.size());
+        std::memcpy(indexBuffersMapped_[i], result.indices.data(), sizeof(uint32_t) * result.indices.size());
+        indexCounts_[i] = static_cast<uint32_t>(result.indices.size());
+    }
+    activeLeafPatches_ = std::move(result.leaves);
+}
+
+glm::mat4 GlobeApp::computeModelRotation() const {
+    return glm::rotate(glm::mat4(1.0f), rotationPitch_, glm::vec3(1.0f, 0.0f, 0.0f))
+         * glm::rotate(glm::mat4(1.0f), rotationYaw_, glm::vec3(0.0f, 1.0f, 0.0f));
+}
+
+// Camera position in the mesh's object space: the camera sits at world-space
+// (0, 0, cameraDistance_) (see updateUniformBuffer's lookAt), and the model
+// rotation is orthonormal, so its inverse is its transpose.
+glm::vec3 GlobeApp::computeCameraObjectPos() const {
+    const glm::mat3 rotation(computeModelRotation());
+    const glm::vec3 cameraWorldPos(0.0f, 0.0f, static_cast<float>(cameraDistance_));
+    return glm::transpose(rotation) * cameraWorldPos;
+}
+
+// Quadtree mesh rebuilds (LOD selection + retessellation, potentially
+// thousands of leaves) are too expensive to run synchronously every frame
+// without dropping frames. This swaps in the result of the previous
+// background rebuild (if any finished), propagates a pending result into
+// the current frame slot's buffers, and, if the camera has moved enough and
+// nothing is in flight or pending, kicks off the next rebuild on a
+// background thread. The render thread never blocks on the rebuild itself.
+void GlobeApp::updateMesh() {
+    const glm::vec3 cameraObjectPos = computeCameraObjectPos();
+
+    // Pick up a finished background build and stage it for propagation into
+    // every in-flight frame slot's buffers.
+    if (pendingMeshWritesRemaining_ == 0 && meshFuture_.valid() &&
+        meshFuture_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        MeshBuildResult result = meshFuture_.get();
+
+        if (result.vertices.size() > QuadtreeMesh::kMaxVertices || result.indices.size() > QuadtreeMesh::kMaxIndices) {
+            throw std::runtime_error("Quadtree mesh exceeded vertex/index buffer capacity");
+        }
+
+        if (result.leaves != activeLeafPatches_) {
+            pendingMeshResult_ = std::move(result);
+            pendingMeshWritesRemaining_ = static_cast<int>(kMaxFramesInFlight);
+        }
+    }
+
+    // Write the pending mesh into this frame slot's buffers. The
+    // vkWaitForFences at the top of drawFrame() guarantees the GPU is done
+    // reading this slot's previous contents, so overwriting it here is safe
+    // even though the other slot may still be mid-flight.
+    if (pendingMeshWritesRemaining_ > 0) {
+        const MeshBuildResult& result = *pendingMeshResult_;
+        std::memcpy(vertexBuffersMapped_[currentFrame_], result.vertices.data(), sizeof(Vertex) * result.vertices.size());
+        std::memcpy(indexBuffersMapped_[currentFrame_], result.indices.data(), sizeof(uint32_t) * result.indices.size());
+        indexCounts_[currentFrame_] = static_cast<uint32_t>(result.indices.size());
+
+        if (--pendingMeshWritesRemaining_ == 0) {
+            activeLeafPatches_ = std::move(pendingMeshResult_->leaves);
+            pendingMeshResult_.reset();
+        }
+    }
+
+    if (pendingMeshWritesRemaining_ == 0 && !meshFuture_.valid() &&
+        glm::length(cameraObjectPos - lastLodCameraPos_) >= kLodRebuildThreshold) {
+        lastLodCameraPos_ = cameraObjectPos;
+        meshFuture_ = std::async(std::launch::async, [cameraObjectPos]() {
+            MeshBuildResult result;
+            result.leaves = QuadtreeMesh::selectLeafPatches(cameraObjectPos);
+            QuadtreeMesh::generateMesh(result.leaves, result.vertices, result.indices);
+            return result;
+        });
+    }
 }
 
 void GlobeApp::createUniformBuffers() {
@@ -1218,8 +1339,7 @@ void GlobeApp::createUniformBuffers() {
 
 void GlobeApp::updateUniformBuffer(uint32_t currentImage) const {
     UniformBufferObject ubo{};
-    ubo.model = glm::rotate(glm::mat4(1.0f), rotationPitch_, glm::vec3(1.0f, 0.0f, 0.0f))
-               * glm::rotate(glm::mat4(1.0f), rotationYaw_, glm::vec3(0.0f, 1.0f, 0.0f));
+    ubo.model = computeModelRotation();
     ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, static_cast<float>(cameraDistance_)), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
     ubo.proj = glm::perspective(glm::radians(45.0f),
                                  static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height),
@@ -1324,18 +1444,18 @@ void GlobeApp::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline_);
 
-    const VkBuffer vertexBuffers[] = {vertexBuffer_};
+    const VkBuffer vertexBuffers[] = {vertexBuffers_[currentFrame_]};
     const VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-    vkCmdBindIndexBuffer(commandBuffer, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindIndexBuffer(commandBuffer, indexBuffers_[currentFrame_], 0, VK_INDEX_TYPE_UINT32);
 
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
 
-    vkCmdDrawIndexed(commandBuffer, indexCount_, 1, 0, 0, 0);
+    vkCmdDrawIndexed(commandBuffer, indexCounts_[currentFrame_], 1, 0, 0, 0);
 
     if (wireframeEnabled_) {
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, wireframePipeline_);
-        vkCmdDrawIndexed(commandBuffer, indexCount_, 1, 0, 0, 0);
+        vkCmdDrawIndexed(commandBuffer, indexCounts_[currentFrame_], 1, 0, 0, 0);
     }
 
     vkCmdEndRenderPass(commandBuffer);
@@ -1368,7 +1488,7 @@ void GlobeApp::createSyncObjects() {
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+    for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
         checkVk(vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailableSemaphores_[i]), "Failed to create image available semaphore");
         checkVk(vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &renderFinishedSemaphores_[i]), "Failed to create render finished semaphore");
         checkVk(vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFences_[i]), "Failed to create in-flight fence");
@@ -1377,6 +1497,8 @@ void GlobeApp::createSyncObjects() {
 
 void GlobeApp::drawFrame() {
     checkVk(vkWaitForFences(device_, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX), "Failed to wait for fence");
+
+    updateMesh();
 
     uint32_t imageIndex = 0;
     VkResult acquireResult = vkAcquireNextImageKHR(

@@ -64,7 +64,7 @@ add_custom_target(shaders ALL DEPENDS ${SHADER_OUTPUT_DIR}/sphere.vert.spv ${SHA
 add_executable(vulkan_triangle
     src/main.cpp
     src/GlobeApp.cpp
-    src/IcosphereMesh.cpp
+    src/QuadtreeMesh.cpp
     src/tiff_loader.cpp
 )
 
