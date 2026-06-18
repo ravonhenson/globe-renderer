@@ -1,5 +1,6 @@
 #pragma once
 
+#include "HexGrid.h"
 #include "QuadtreeMesh.h"
 #include "VulkanUtils.h"
 
@@ -145,11 +146,20 @@ private:
 
     // Camera/input tuning.
     static constexpr double kInitialCameraDistance = 2.5;
-    static constexpr double kMinCameraDistance = 1.15;
-    static constexpr double kMaxCameraDistance = 6.0;
-    static constexpr double kZoomSpeed = 0.05;
-    static constexpr float kRotationSpeed = 0.005f;
-    static constexpr float kMaxPitch = glm::radians(89.0f);
+    static constexpr double kMinCameraDistance     = 1.001; // ~640 m above unit-sphere surface
+    static constexpr double kMaxCameraDistance     = 6.0;
+    // Altitude-proportional zoom: each scroll unit moves the camera by this
+    // fraction of the current altitude above the surface. Keeps step size
+    // physically sensible at every zoom level and is immune to large per-event
+    // yoffset values from trackpads / high-resolution scroll wheels.
+    static constexpr double kZoomSensitivity = 0.15;
+    static constexpr float  kRotationSpeed = 0.005f;
+    static constexpr float  kMaxPitch      = glm::radians(89.0f);
+
+    // Hex overlay tuning.
+    static constexpr double kHexOverlayThreshold = kMaxCameraDistance;
+    static constexpr int    kHexSubdivisions     = 6;     // icosphere dual: N=6 → ~41k cells, circumradius ≈ 0.016
+    static constexpr float  kHexNormalLength     = 0.05f; // outward extent in unit-sphere units
 
     // Minimum object-space camera movement (in unit-sphere units) before
     // the quadtree LOD is re-evaluated. Without this, the active leaf set
@@ -164,8 +174,26 @@ private:
     bool dragging_ = false;
     double lastCursorX_ = 0.0;
     double lastCursorY_ = 0.0;
-    bool wireframeEnabled_ = false;
-    bool fpsCounterEnabled_ = false;
+    bool wireframeEnabled_   = false;
+    bool fpsCounterEnabled_  = false;
+    bool hexOverlayEnabled_  = true;
+    bool hexNormalsEnabled_  = false;
+
+    // Hex overlay — full-sphere wireframe baked once at startup into a
+    // device-local buffer. Rendered with the globe's model matrix so cells
+    // are fixed features of the globe surface.
+    VkBuffer       hexVertexBuffer_       = VK_NULL_HANDLE;
+    VkDeviceMemory hexVertexBufferMemory_ = VK_NULL_HANDLE;
+    uint32_t       hexVertexCount_        = 0;
+
+    // Outward normals at each hex cell centre (toggle with N key).
+    VkBuffer       hexNormalBuffer_       = VK_NULL_HANDLE;
+    VkDeviceMemory hexNormalBufferMemory_ = VK_NULL_HANDLE;
+    uint32_t       hexNormalCount_        = 0;
+
+    // Hex overlay pipeline and layout (recreated with the swapchain).
+    VkPipeline       hexPipeline_       = VK_NULL_HANDLE;
+    VkPipelineLayout hexPipelineLayout_ = VK_NULL_HANDLE;
 
     static void framebufferResizeCallback(GLFWwindow* window, int width, int height);
     static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset);
@@ -256,6 +284,8 @@ private:
     }
 
     void createMeshBuffers();
+    void initHexOverlay();
+    void createHexPipeline();
     glm::mat4 computeModelRotation() const;
     glm::vec3 computeCameraObjectPos() const;
     void updateMesh();

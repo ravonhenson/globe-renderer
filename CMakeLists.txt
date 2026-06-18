@@ -59,11 +59,34 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(shaders ALL DEPENDS ${SHADER_OUTPUT_DIR}/sphere.vert.spv ${SHADER_OUTPUT_DIR}/sphere.frag.spv ${SHADER_OUTPUT_DIR}/wireframe.frag.spv)
+add_custom_command(
+    OUTPUT ${SHADER_OUTPUT_DIR}/hex.vert.spv
+    COMMAND ${GLSLC_EXECUTABLE} ${SHADER_SOURCE_DIR}/hex.vert -o ${SHADER_OUTPUT_DIR}/hex.vert.spv
+    DEPENDS ${SHADER_SOURCE_DIR}/hex.vert
+    COMMENT "Compiling hex.vert"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${SHADER_OUTPUT_DIR}/hex.frag.spv
+    COMMAND ${GLSLC_EXECUTABLE} ${SHADER_SOURCE_DIR}/hex.frag -o ${SHADER_OUTPUT_DIR}/hex.frag.spv
+    DEPENDS ${SHADER_SOURCE_DIR}/hex.frag
+    COMMENT "Compiling hex.frag"
+    VERBATIM
+)
+
+add_custom_target(shaders ALL DEPENDS
+    ${SHADER_OUTPUT_DIR}/sphere.vert.spv
+    ${SHADER_OUTPUT_DIR}/sphere.frag.spv
+    ${SHADER_OUTPUT_DIR}/wireframe.frag.spv
+    ${SHADER_OUTPUT_DIR}/hex.vert.spv
+    ${SHADER_OUTPUT_DIR}/hex.frag.spv
+)
 
 add_executable(vulkan_triangle
     src/main.cpp
     src/GlobeApp.cpp
+    src/HexGrid.cpp
     src/QuadtreeMesh.cpp
     src/tiff_loader.cpp
 )

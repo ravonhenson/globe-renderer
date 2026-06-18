@@ -1,5 +1,6 @@
 #include "GlobeApp.h"
 
+#include "HexGrid.h"
 #include "QuadtreeMesh.h"
 #include "Vertex.h"
 #include "tiff_loader.h"
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -57,7 +59,8 @@ void GlobeApp::framebufferResizeCallback(GLFWwindow* window, int, int) {
 
 void GlobeApp::scrollCallback(GLFWwindow* window, double /*xoffset*/, double yoffset) {
     auto* app = reinterpret_cast<GlobeApp*>(glfwGetWindowUserPointer(window));
-    app->cameraDistance_ -= yoffset * kZoomSpeed;
+    const double altitude = app->cameraDistance_ - 1.0;
+    app->cameraDistance_ -= yoffset * altitude * kZoomSensitivity;
     app->cameraDistance_ = std::clamp(app->cameraDistance_, kMinCameraDistance, kMaxCameraDistance);
 }
 
@@ -79,6 +82,12 @@ void GlobeApp::keyCallback(GLFWwindow* window, int key, int /*scancode*/, int ac
     auto* app = reinterpret_cast<GlobeApp*>(glfwGetWindowUserPointer(window));
     if (key == GLFW_KEY_L && action == GLFW_PRESS) {
         app->wireframeEnabled_ = !app->wireframeEnabled_;
+    }
+    if (key == GLFW_KEY_H && action == GLFW_PRESS) {
+        app->hexOverlayEnabled_ = !app->hexOverlayEnabled_;
+    }
+    if (key == GLFW_KEY_N && action == GLFW_PRESS) {
+        app->hexNormalsEnabled_ = !app->hexNormalsEnabled_;
     }
     if (key == GLFW_KEY_F && action == GLFW_PRESS) {
         app->fpsCounterEnabled_ = !app->fpsCounterEnabled_;
@@ -132,6 +141,7 @@ void GlobeApp::initVulkan() {
     createRenderPass();
     createDescriptorSetLayout();
     createGraphicsPipeline();
+    createHexPipeline();
     createCommandPool();
     createDepthResources();
     createFramebuffers();
@@ -142,6 +152,7 @@ void GlobeApp::initVulkan() {
     createHeightmapImageView();
     createHeightmapSampler();
     createMeshBuffers();
+    initHexOverlay();
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
@@ -191,6 +202,8 @@ void GlobeApp::cleanupSwapchain() {
     vkDestroyPipeline(device_, graphicsPipeline_, nullptr);
     vkDestroyPipeline(device_, wireframePipeline_, nullptr);
     vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+    vkDestroyPipeline(device_, hexPipeline_, nullptr);
+    vkDestroyPipelineLayout(device_, hexPipelineLayout_, nullptr);
     vkDestroyRenderPass(device_, renderPass_, nullptr);
 
     for (VkImageView imageView : swapchainImageViews_) {
@@ -232,6 +245,11 @@ void GlobeApp::cleanup() {
         vkFreeMemory(device_, vertexBufferMemories_[i], nullptr);
     }
 
+    vkDestroyBuffer(device_, hexVertexBuffer_, nullptr);
+    vkFreeMemory(device_, hexVertexBufferMemory_, nullptr);
+    vkDestroyBuffer(device_, hexNormalBuffer_, nullptr);
+    vkFreeMemory(device_, hexNormalBufferMemory_, nullptr);
+
     for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
         vkDestroySemaphore(device_, renderFinishedSemaphores_[i], nullptr);
         vkDestroySemaphore(device_, imageAvailableSemaphores_[i], nullptr);
@@ -266,6 +284,7 @@ void GlobeApp::recreateSwapchain() {
     createImageViews();
     createRenderPass();
     createGraphicsPipeline();
+    createHexPipeline();
     createDepthResources();
     createFramebuffers();
     createCommandBuffers();
@@ -1268,6 +1287,129 @@ glm::vec3 GlobeApp::computeCameraObjectPos() const {
     return glm::transpose(rotation) * cameraWorldPos;
 }
 
+void GlobeApp::initHexOverlay() {
+    std::vector<HexVertex> verts;
+    HexGrid::generateSphericalWireframe(kHexSubdivisions, verts);
+    hexVertexCount_ = static_cast<uint32_t>(verts.size());
+    createDeviceLocalBuffer(verts, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                            hexVertexBuffer_, hexVertexBufferMemory_);
+
+    std::vector<HexVertex> normals;
+    HexGrid::generateNormalLines(kHexSubdivisions, kHexNormalLength, normals);
+    hexNormalCount_ = static_cast<uint32_t>(normals.size());
+    createDeviceLocalBuffer(normals, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                            hexNormalBuffer_, hexNormalBufferMemory_);
+}
+
+void GlobeApp::createHexPipeline() {
+    const std::vector<char> vertCode = loadShaderBinary("shaders/hex.vert.spv");
+    const std::vector<char> fragCode = loadShaderBinary("shaders/hex.frag.spv");
+
+    const VkShaderModule vertModule = createShaderModule(vertCode);
+    const VkShaderModule fragModule = createShaderModule(fragCode);
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertModule;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragModule;
+    stages[1].pName  = "main";
+
+    const VkVertexInputBindingDescription binding = HexVertex::bindingDescription();
+    const auto attributes = HexVertex::attributeDescriptions();
+
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount   = 1;
+    vertexInput.pVertexBindingDescriptions      = &binding;
+    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributes.size());
+    vertexInput.pVertexAttributeDescriptions    = attributes.data();
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+
+    VkViewport viewport{};
+    viewport.width    = static_cast<float>(swapchainExtent_.width);
+    viewport.height   = static_cast<float>(swapchainExtent_.height);
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor{};
+    scissor.extent = swapchainExtent_;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.pViewports    = &viewport;
+    viewportState.scissorCount  = 1;
+    viewportState.pScissors     = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth   = 1.0f;
+    rasterizer.cullMode    = VK_CULL_MODE_NONE;
+    rasterizer.frontFace   = VK_FRONT_FACE_CLOCKWISE;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable  = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_FALSE;
+    depthStencil.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments    = &blendAttachment;
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushRange.size       = sizeof(glm::mat4);
+
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount         = 1;
+    layoutInfo.pSetLayouts            = &descriptorSetLayout_;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges    = &pushRange;
+
+    checkVk(vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &hexPipelineLayout_),
+            "Failed to create hex pipeline layout");
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount          = 2;
+    pipelineInfo.pStages             = stages;
+    pipelineInfo.pVertexInputState   = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState      = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState   = &multisampling;
+    pipelineInfo.pDepthStencilState  = &depthStencil;
+    pipelineInfo.pColorBlendState    = &colorBlend;
+    pipelineInfo.layout              = hexPipelineLayout_;
+    pipelineInfo.renderPass          = renderPass_;
+    pipelineInfo.subpass             = 0;
+
+    checkVk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo,
+                                       nullptr, &hexPipeline_),
+            "Failed to create hex pipeline");
+
+    vkDestroyShaderModule(device_, fragModule, nullptr);
+    vkDestroyShaderModule(device_, vertModule, nullptr);
+}
+
 // Quadtree mesh rebuilds (LOD selection + retessellation, potentially
 // thousands of leaves) are too expensive to run synchronously every frame
 // without dropping frames. This swaps in the result of the previous
@@ -1310,8 +1452,14 @@ void GlobeApp::updateMesh() {
         }
     }
 
+    // Scale the rebuild threshold with altitude so close-in zoom triggers LOD
+    // updates as aggressively as globe-scale rotation does. Capped at the
+    // globe-scale constant so we don't rebuild every frame while rotating far out.
+    const float altitude = static_cast<float>(cameraDistance_ - 1.0);
+    const float lodThreshold = std::min(kLodRebuildThreshold, std::max(altitude * 0.5f, 0.001f));
+
     if (pendingMeshWritesRemaining_ == 0 && !meshFuture_.valid() &&
-        glm::length(cameraObjectPos - lastLodCameraPos_) >= kLodRebuildThreshold) {
+        glm::length(cameraObjectPos - lastLodCameraPos_) >= lodThreshold) {
         lastLodCameraPos_ = cameraObjectPos;
         meshFuture_ = std::async(std::launch::async, [cameraObjectPos]() {
             MeshBuildResult result;
@@ -1341,9 +1489,15 @@ void GlobeApp::updateUniformBuffer(uint32_t currentImage) const {
     UniformBufferObject ubo{};
     ubo.model = computeModelRotation();
     ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, static_cast<float>(cameraDistance_)), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    // Near plane: 5 % of altitude above the unit sphere so it never clips
+    // the surface. Far plane: diameter + altitude so the full globe stays
+    // visible at any zoom level. Both scale continuously with camera height.
+    const float altitude  = static_cast<float>(cameraDistance_) - 1.0f;
+    const float nearPlane = std::max(altitude * 0.05f, 1e-5f);
+    const float farPlane  = 2.0f + static_cast<float>(cameraDistance_);
     ubo.proj = glm::perspective(glm::radians(45.0f),
                                  static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height),
-                                 0.1f, 10.0f);
+                                 nearPlane, farPlane);
     ubo.proj[1][1] *= -1.0f;
 
     std::memcpy(uniformBuffersMapped_[currentImage], &ubo, sizeof(ubo));
@@ -1442,20 +1596,54 @@ void GlobeApp::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     renderPassInfo.pClearValues = clearValues.data();
 
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Globe mesh.
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline_);
 
-    const VkBuffer vertexBuffers[] = {vertexBuffers_[currentFrame_]};
-    const VkDeviceSize offsets[] = {0};
-    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+    const VkBuffer globeVBufs[] = {vertexBuffers_[currentFrame_]};
+    const VkDeviceSize globeOffsets[] = {0};
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, globeVBufs, globeOffsets);
     vkCmdBindIndexBuffer(commandBuffer, indexBuffers_[currentFrame_], 0, VK_INDEX_TYPE_UINT32);
-
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
-
     vkCmdDrawIndexed(commandBuffer, indexCounts_[currentFrame_], 1, 0, 0, 0);
 
     if (wireframeEnabled_) {
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, wireframePipeline_);
         vkCmdDrawIndexed(commandBuffer, indexCounts_[currentFrame_], 1, 0, 0, 0);
+    }
+
+    // Hex overlay — drawn on top of the globe when close enough and enabled.
+    if (hexOverlayEnabled_ && cameraDistance_ <= kHexOverlayThreshold) {
+        const glm::mat4 model = computeModelRotation();
+        const glm::mat4 view  = glm::lookAt(
+            glm::vec3(0.0f, 0.0f, static_cast<float>(cameraDistance_)),
+            glm::vec3(0.0f),
+            glm::vec3(0.0f, 1.0f, 0.0f));
+        const float hexAltitude  = static_cast<float>(cameraDistance_) - 1.0f;
+        const float hexNearPlane = std::max(hexAltitude * 0.05f, 1e-5f);
+        const float hexFarPlane  = 2.0f + static_cast<float>(cameraDistance_);
+        glm::mat4 proj = glm::perspective(
+            glm::radians(45.0f),
+            static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height),
+            hexNearPlane, hexFarPlane);
+        proj[1][1] *= -1.0f;
+        const glm::mat4 mvp = proj * view * model;
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, hexPipeline_);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                hexPipelineLayout_, 0, 1, &descriptorSets_[currentFrame_], 0, nullptr);
+        const VkBuffer hexVBufs[] = {hexVertexBuffer_};
+        const VkDeviceSize hexOffsets[] = {0};
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, hexVBufs, hexOffsets);
+        vkCmdPushConstants(commandBuffer, hexPipelineLayout_,
+                           VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &mvp);
+        vkCmdDraw(commandBuffer, hexVertexCount_, 1, 0, 0);
+
+        if (hexNormalsEnabled_) {
+            const VkBuffer normalVBufs[] = {hexNormalBuffer_};
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, normalVBufs, hexOffsets);
+            vkCmdDraw(commandBuffer, hexNormalCount_, 1, 0, 0);
+        }
     }
 
     vkCmdEndRenderPass(commandBuffer);
